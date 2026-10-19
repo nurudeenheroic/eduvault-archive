@@ -4,18 +4,21 @@ import { NextResponse } from "next/server";
 import { auditLog } from "@/lib/api/audit";
 import { withApiHardening } from "@/lib/api/hardening";
 import { parsePagination } from "@/lib/api/validation";
-import { applyOwnershipRanking, buildMarketplaceDiscoveryQuery, buildMarketplaceSort, decodeMarketplaceCursor, buildMarketplaceCursorClause } from "@/lib/backend/marketplaceDiscovery";
+import { applyMarketplaceRelevanceRanking, applyOwnershipRanking, buildMarketplaceDiscoveryQuery, buildMarketplaceFacetPipeline, buildMarketplaceSort, decodeMarketplaceCursor, encodeMarketplaceCursor, buildMarketplaceCursorClause } from "@/lib/backend/marketplaceDiscovery";
 import { MATERIAL_SEARCH_COLLECTION } from "@/lib/backend/materialSearchProjection";
 import { getOwnedMaterialIds } from "@/lib/entitlement";
 import { getDb } from "@/lib/mongodb";
 import { ObjectId } from "mongodb";
-import { cacheGet, cacheSet } from "@/lib/cache/redis";
+import { cacheGet, cacheSet, catalogCacheKey } from "@/lib/cache/redis";
+
+import { sanitizeMaterialPublic } from "@/lib/storage/protectedStorage";
 
 export const runtime = "nodejs";
 
 function sanitizeMaterial(doc) {
   if (!doc) return doc;
-  const { storageKey, fileUrl, metadataUrl, ...safe } = doc;
+  const publicSafe = sanitizeMaterialPublic(doc);
+  const { storageKey, fileUrl, metadataUrl, ...safe } = publicSafe;
   const averageScore = Number(safe.averageScore ?? safe.rating ?? 0) || 0;
   const feedbackCount = Number(safe.feedbackCount ?? safe.reviewsCount ?? 0) || 0;
 
@@ -79,20 +82,25 @@ export async function GET(request) {
     // shared anonymous-browse cache is bypassed for this request.
     const buyerAddress = (url.searchParams.get("buyerAddress") || "").trim() || null;
 
-    const cacheKey = `market-materials:${url.searchParams.toString()}`;
+    const cacheKey = await catalogCacheKey(url.searchParams.toString());
     const cached = buyerAddress ? null : await cacheGet(cacheKey);
     if (cached) {
       return NextResponse.json(cached, { status: 200 });
     }
 
     const query = buildMarketplaceDiscoveryQuery(url.searchParams);
-    const sort = buildMarketplaceSort(url.searchParams.get("sortBy"));
+    const searchTerm = url.searchParams.get("search") || "";
+    const sortBy = url.searchParams.get("sortBy") || (searchTerm ? "relevance" : "newest");
+    const sort = buildMarketplaceSort(sortBy);
+    const facetsRequested = ["1", "true"].includes(url.searchParams.get("includeFacets"));
+    const facetQuery = facetsRequested ? buildMarketplaceDiscoveryQuery(url.searchParams) : null;
 
     let items;
     let hasNextPage = false;
     let nextCursor = null;
     let totalPages = null;
     let total = null;
+    let facets = null;
 
     if (paginationType === "cursor") {
       // Cursor-based pagination
@@ -126,7 +134,7 @@ export async function GET(request) {
       // Generate next cursor if there are more items
       if (hasNextPage && items.length > 0) {
         const lastItem = items[items.length - 1];
-        nextCursor = Buffer.from(JSON.stringify({ _id: lastItem._id.toString(), ...Object.fromEntries(Object.keys(sort).filter((field) => field !== "_id").map((field) => [field, lastItem[field] instanceof Date ? lastItem[field].toISOString() : lastItem[field]])) })).toString('base64url');
+        nextCursor = encodeMarketplaceCursor(lastItem, sort);
       }
     } else {
       // Legacy offset-based pagination
@@ -146,6 +154,21 @@ export async function GET(request) {
 
     let normalized = items.map(sanitizeMaterial);
 
+    if (searchTerm || sortBy === "relevance") {
+      normalized = applyMarketplaceRelevanceRanking(normalized, searchTerm);
+    }
+
+    if (facetsRequested) {
+      const facetRows = await db
+        .collection(MATERIAL_SEARCH_COLLECTION)
+        .aggregate(buildMarketplaceFacetPipeline(facetQuery))
+        .toArray();
+      facets = Object.fromEntries(Object.entries(facetRows[0] || {}).map(([field, values]) => [
+        field,
+        values.map(({ _id: value, count }) => ({ value, count })),
+      ]));
+    }
+
     // Entitlement-aware ranking (#707): mark and rerank this page's results
     // by whether the viewing wallet already owns each material. Best-effort
     // — a lookup failure just leaves the page unranked, never blocks it.
@@ -163,6 +186,7 @@ export async function GET(request) {
           pageSize,
           hasNextPage,
           nextCursor,
+          ...(facets ? { facets } : {}),
           paginationType: "cursor"
         }
       : {
@@ -171,6 +195,7 @@ export async function GET(request) {
           pageSize,
           total,
           totalPages,
+          ...(facets ? { facets } : {}),
           paginationType: "offset"
         };
 

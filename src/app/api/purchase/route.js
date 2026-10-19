@@ -11,6 +11,10 @@ import {
 } from "@/lib/purchases/access";
 import { broadcastPurchaseEvent } from '@/lib/webhooks/sender';
 import { sendReceiptIfEligible } from '@/lib/email';
+import { createCheckoutQuote, consumeCheckoutQuote } from '@/lib/checkout/quotes';
+import { buildAnalyticsEvent, recordServerAnalyticsEvent } from '@/lib/backend/analyticsEvents';
+import { appendCriticalMutation } from '@/lib/backend/auditLedger';
+import { withTelemetryRoute, ACTOR_TYPES } from '@/lib/monitoring/telemetry';
 
 function duplicateKey(error) {
   return error?.code === 11000;
@@ -20,6 +24,22 @@ function duplicateKey(error) {
 // post-insert race path (a concurrent request won the unique-index race),
 // so side effects (entitlement/receipt/webhook) fire exactly once per
 // actual purchase regardless of which path resolves it.
+/**
+ * Fire a server-confirmed purchase analytics event. This is a fire-and-forget
+ * call — it MUST NOT throw and block the purchase response.
+ */
+function recordPurchaseAnalytics(db, { materialId, buyerAddress }) {
+  const event = buildAnalyticsEvent({
+    materialId: String(materialId),
+    eventType: 'purchase',
+    viewerId: buyerAddress,
+    source: 'server-confirmed',
+  });
+  recordServerAnalyticsEvent(db, event).catch(err =>
+    console.error('[purchase] analytics recording failed (non-fatal):', err)
+  );
+}
+
 async function respondForExistingPurchase(db, existing, { materialId, buyerAddress, paymentCompleted, transactionHash, signedXdr, amount, asset, email }) {
   if (isCompletedPurchaseStatus(existing.status)) {
     await createEntitlement(materialId, buyerAddress, {
@@ -27,6 +47,9 @@ async function respondForExistingPurchase(db, existing, { materialId, buyerAddre
       transactionHash: existing.transactionHash,
     });
     const access = await getMaterialAccessStatus(db, materialId, buyerAddress);
+    // Server-confirmed event: purchase was already finalized, buyer is re-accessing.
+    // We still record to deduplicate in the time window — duplicate within window is a no-op.
+    recordPurchaseAnalytics(db, { materialId, buyerAddress });
     return NextResponse.json(
       { message: 'Already purchased', purchase: existing, access, transactionHash: existing.transactionHash },
       { status: 200 }
@@ -60,9 +83,22 @@ async function respondForExistingPurchase(db, existing, { materialId, buyerAddre
   );
 
   const purchase = await db.collection('purchases').findOne({ _id: existing._id });
+  await appendCriticalMutation({
+    db,
+    operationId: `purchase.confirmed:${String(existing._id)}`,
+    actor: buyerAddress,
+    action: 'purchase.payment_confirmed',
+    target: { type: 'purchase', id: String(existing._id) },
+    reason: 'Confirmed checkout payment',
+    before: { status: existing.status, amount: existing.amount ?? null, asset: existing.asset ?? null },
+    after: { status: purchase.status, amount: purchase.amount ?? null, asset: purchase.asset ?? null, materialId: purchase.materialId },
+    intent: { materialId, paymentCompleted: true },
+  });
   const access = await getMaterialAccessStatus(db, materialId, buyerAddress);
 
   sendReceiptIfEligible(db, existing._id).catch(err => console.error(err));
+  // Fire server-confirmed purchase analytics — authoritative, immune to ad blockers.
+  recordPurchaseAnalytics(db, { materialId, buyerAddress });
   // Fire webhook asynchronously
   broadcastPurchaseEvent(materialId, {
     buyerAddress,
@@ -100,13 +136,13 @@ export async function GET(req) {
   }
 }
 
-export async function POST(req) {
+async function handlePost(req) {
   try {
     const user = await getUserFromCookie(req);
     const db = await getDb();
     const body = await req.json();
 
-    const { materialId, signedXdr, email, transactionHash, amount, asset, buyerAddress: bodyBuyerAddress } = body;
+    const { materialId, signedXdr, email, transactionHash, amount, asset, quoteId, action, buyerAddress: bodyBuyerAddress } = body;
     const buyerAddress = normalizeBuyerAddress(
       user?.walletAddress || user?.address || user?.id || bodyBuyerAddress
     );
@@ -120,12 +156,35 @@ export async function POST(req) {
       return NextResponse.json({ error: user ? "Missing buyer address" : "Unauthorized" }, { status: user ? 400 : 401 });
     }
 
-    const purchaseContext = { materialId, buyerAddress, paymentCompleted, transactionHash, signedXdr, amount, asset, email };
+    if (action === 'quote') {
+      const quote = await createCheckoutQuote(db, { materialId, buyerAddress });
+      return NextResponse.json({ quoteId: quote.quoteId, materialId: quote.materialId, ...quote.terms, expiresAt: quote.expiresAt }, { status: 201 });
+    }
+
+    const existing = await db.collection('purchases').findOne({ buyerAddress, materialId });
+    if (existing && isCompletedPurchaseStatus(existing.status)) {
+      return respondForExistingPurchase(db, existing, { materialId, buyerAddress, paymentCompleted, transactionHash, signedXdr, amount, asset, email });
+    }
+
+    if (paymentCompleted && !quoteId) {
+      return NextResponse.json({ error: 'A valid checkout quote is required. Refresh the listing and try again.' }, { status: 409 });
+    }
+
+    let quote = null;
+    if (paymentCompleted) {
+      try {
+        quote = await consumeCheckoutQuote(db, { quoteId, materialId, buyerAddress });
+      } catch (error) {
+        return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+      }
+    }
+
+    const quotedAmount = quote?.terms?.price ?? amount;
+    const quotedAsset = quote?.terms?.asset ?? asset;
+
+    const purchaseContext = { materialId, buyerAddress, paymentCompleted, transactionHash, signedXdr, amount: quotedAmount, asset: quotedAsset, email };
 
     // Prevent duplicate purchases
-    const existing = await db
-      .collection('purchases')
-      .findOne({ buyerAddress, materialId });
     if (existing) {
       return respondForExistingPurchase(db, existing, purchaseContext);
     }
@@ -139,8 +198,10 @@ export async function POST(req) {
       status: paymentCompleted ? 'confirmed' : 'pending',
       transactionHash: transactionHash || null,
       signedXdr: signedXdr || null,
-      amount: amount ?? null,
-      asset: asset || null,
+      amount: quotedAmount ?? null,
+      asset: quotedAsset || null,
+      quoteId: quote?.quoteId || null,
+      purchaseSnapshot: quote?.terms || null,
       purchasedAt: paymentCompleted ? now : null,
       confirmedAt: paymentCompleted ? now : null,
       createdAt: now,
@@ -164,12 +225,30 @@ export async function POST(req) {
     const access = await getMaterialAccessStatus(db, materialId, buyerAddress);
 
     if (paymentCompleted) {
+      await appendCriticalMutation({
+        db,
+        operationId: `purchase.confirmed:${String(result.insertedId)}`,
+        actor: buyerAddress,
+        action: 'purchase.payment_confirmed',
+        target: { type: 'purchase', id: String(result.insertedId) },
+        reason: 'Confirmed checkout payment',
+        before: { status: null },
+        after: { status: purchaseRecord.status, amount: purchaseRecord.amount, asset: purchaseRecord.asset, materialId },
+        intent: { materialId, paymentCompleted: true, quoteId: quote?.quoteId || null },
+      });
+    }
+
+    if (paymentCompleted) {
       await createEntitlement(materialId, buyerAddress, {
         purchaseId: String(result.insertedId),
         transactionHash: transactionHash || null,
       });
 
       sendReceiptIfEligible(db, result.insertedId).catch(err => console.error(err));
+      // Server-confirmed purchase analytics — written immediately without the
+      // outbox queue so they survive even if the client page is closed right
+      // after payment. Never allowed to throw and disrupt the purchase response.
+      recordPurchaseAnalytics(db, { materialId, buyerAddress });
 
       // Fire webhook asynchronously
       broadcastPurchaseEvent(materialId, purchaseRecord);
@@ -184,3 +263,5 @@ export async function POST(req) {
     return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }
+
+export const POST = withTelemetryRoute('purchase.complete', ACTOR_TYPES.USER, handlePost);
